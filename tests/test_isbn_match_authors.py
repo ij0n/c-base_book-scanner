@@ -112,8 +112,8 @@ def _candidate(authors: list[str]) -> IdentificationCandidate:
 
 def _upload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, authors: list[str]) -> ImportJob:
     monkeypatch.setattr(
-        "ebook_server.core.identification.resolve_candidates",
-        lambda signals: [_candidate(authors)],
+        "ebook_server.core.identification.resolve_candidates_with_report",
+        lambda signals: ([_candidate(authors)], []),
     )
     _configure_storage(tmp_path)
     storage_root = tmp_path / "storage"
