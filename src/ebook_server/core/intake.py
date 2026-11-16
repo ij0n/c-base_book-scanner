@@ -1305,6 +1305,10 @@ def _propagate_book_to_siblings(job: ImportJob, book: Book) -> None:
         )
 
 
+AUTO_ACCEPT_BLOCKED_KEY = "auto_accept_blocked"
+BOOK_AUTHORS_SOURCE_KEY = "book_authors_source"
+
+
 def _provision_book_from_metadata(
     *,
     candidate: identification.IdentificationCandidate | None,
@@ -1537,7 +1541,25 @@ def process_import_job(job_id: str) -> None:
         _save_metadata_candidates(job, candidates, search=search)
 
         top_candidate = candidates[0] if candidates else None
-        if top_candidate is None or top_candidate.score < AUTO_ACCEPT_SCORE:
+        file_authors = identification.evidence_author_names(metadata)
+        auto_accept = top_candidate is not None and top_candidate.score >= AUTO_ACCEPT_SCORE
+        if (
+            auto_accept
+            and top_candidate is not None
+            and identification.authors_conflict(top_candidate.authors, file_authors)
+        ):
+            # A high score (e.g. an ISBN match) that names other authors than the file
+            # itself must not be accepted silently.
+            auto_accept = False
+            metadata[AUTO_ACCEPT_BLOCKED_KEY] = {
+                "reason": "authors of the best match differ from the file's authors",
+                "score": top_candidate.score,
+                "candidate_authors": list(top_candidate.authors),
+                "file_authors": file_authors,
+            }
+            job.evidence = metadata
+            job.save(update_fields=["evidence", "updated_at"])
+        if not auto_accept or top_candidate is None:
             review_task = _create_review_task(job=job, candidates=candidates)
             search.review_task = review_task
             search.save(update_fields=["review_task"])
@@ -1572,15 +1594,28 @@ def process_import_job(job_id: str) -> None:
 
         job.state = ImportJob.State.MATCHED
         job.save(update_fields=["state", "updated_at"])
-        book = _archive_and_complete_with_book(
-            job,
-            None,
-            provision=lambda: _provision_book_from_metadata(
-                candidate=top_candidate,
-                fallback_title=top_candidate.title,
+        match = top_candidate
+
+        def provision() -> Book:
+            book = _provision_book_from_metadata(
+                candidate=match,
+                fallback_title=match.title,
                 extra_metadata=metadata,
-            ),
-        )
+            )
+            if not match.authors and file_authors and not book.authors.exists():
+                # The match carries no authors (e.g. an edition record without them):
+                # use the file's own author evidence and record that it came from there.
+                for author_name in file_authors:
+                    author, _ = Author.objects.get_or_create(
+                        full_name=_fit(Author, "full_name", author_name),
+                    )
+                    book.authors.add(author)
+                metadata[BOOK_AUTHORS_SOURCE_KEY] = {"source": "file", "authors": file_authors}
+                job.evidence = metadata
+                job.save(update_fields=["evidence", "updated_at"])
+            return book
+
+        book = _archive_and_complete_with_book(job, None, provision=provision)
         _propagate_book_to_siblings(job, book)
     except Exception as exc:  # pragma: no cover - failure path depends on input surface
         job.last_error = str(exc)
