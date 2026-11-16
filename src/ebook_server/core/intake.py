@@ -53,6 +53,7 @@ from .models import (
     clean_publication_year,
 )
 from .storage_registry import backend_for_location
+from .text_header import parse_text_header
 
 logger = structlog.get_logger(__name__)
 
@@ -565,6 +566,10 @@ def _extract_text_metadata(file_path: str, *, original_filename: str) -> dict[st
     detected = _detected_language_evidence(text)
     if detected is not None:
         metadata["detected_language"] = detected
+    # Plain text has no metadata container; its first lines often name title/author.
+    header = parse_text_header(text, Path(original_filename).stem)
+    if header is not None:
+        metadata[identification.TEXT_HEADER_EVIDENCE_KEY] = header
     return metadata
 
 

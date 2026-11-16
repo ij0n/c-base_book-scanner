@@ -149,6 +149,11 @@ def describe_request_error(exc: BaseException) -> str:
     return type(exc).__name__
 
 
+# Evidence key for title/author hints read from the first lines of plain-text books
+# (see core.text_header); written by intake, read when building signals.
+TEXT_HEADER_EVIDENCE_KEY = "text_header"
+
+
 class MetadataProvider(Protocol):
     """Minimal metadata-provider contract."""
 
@@ -330,6 +335,18 @@ def build_identification_input(
         title_hints = list(filename_title_hints)
 
     author_hints = list(filename_author_hints)
+    header_authors: list[str] = []
+    header = extracted_metadata.get(TEXT_HEADER_EVIDENCE_KEY)
+    if isinstance(header, dict):
+        header_title = header.get("title")
+        if isinstance(header_title, str) and header_title.strip():
+            title_hints.insert(1 if title_hints else 0, header_title.strip())
+        header_authors = [
+            a.strip() for a in header.get("authors") or [] if isinstance(a, str) and a.strip()
+        ]
+        if header_authors:
+            # Authors named in the text itself beat the "A - B" filename split guesses.
+            author_hints = header_authors
     metadata_authors = extracted_metadata.get("authors")
     if isinstance(metadata_authors, list):
         for raw_author in metadata_authors:
@@ -358,8 +375,10 @@ def build_identification_input(
             embedded: list[str] = []
             if isinstance(metadata_authors, list):
                 embedded = [a.strip() for a in metadata_authors if isinstance(a, str) and a.strip()]
-            known = {normalize_text(h) for h in embedded}
-            author_hints = embedded + [a for a in layout_authors if normalize_text(a) not in known]
+            # Text-header authors stay too: they were read from the file itself.
+            combined = list(dict.fromkeys(embedded + header_authors))
+            known = {normalize_text(h) for h in combined}
+            author_hints = combined + [a for a in layout_authors if normalize_text(a) not in known]
 
     title_hints = list(dict.fromkeys([h for h in title_hints if h]))
     author_hints = [h for h in dict.fromkeys(author_hints).keys()] if author_hints else []
@@ -610,13 +629,16 @@ def _display_name(raw: str) -> str:
 
 
 def evidence_author_names(metadata: dict[str, Any]) -> list[str]:
-    """Author names the file itself provides: embedded metadata, then folder-layout hints."""
+    """Author names the file itself provides: embedded metadata, folder layout, text header."""
     raw: list[Any] = []
     if isinstance(metadata.get("authors"), list):
         raw.extend(metadata["authors"])
     layout = metadata.get("path_layout")  # present for sources with a folder layout
     if isinstance(layout, dict) and isinstance(layout.get("authors"), list):
         raw.extend(layout["authors"])
+    header = metadata.get(TEXT_HEADER_EVIDENCE_KEY)  # first lines of plain-text books
+    if isinstance(header, dict) and isinstance(header.get("authors"), list):
+        raw.extend(header["authors"])
     names: list[str] = []
     seen: set[str] = set()
     for value in raw:
