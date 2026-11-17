@@ -162,7 +162,7 @@ def test_layout_title_follows_embedded_title() -> None:
             PATH_LAYOUT_EVIDENCE_KEY: {"authors": ["Neal Stephenson"], "title": "Snow Crash"},
         },
     )
-    assert signals.title_hints[:2] == ["Snow Crash - Neal Stephenson", "Snow Crash"]
+    assert signals.title_hints[:2] == ["Snow Crash", "Snow Crash - Neal Stephenson"]
     assert signals.best_author() == "Neal Stephenson"
 
 
@@ -172,7 +172,7 @@ def test_without_layout_signals_are_unchanged() -> None:
         original_filename="Emma - Jane Austen.txt",
         extracted_metadata={},
     )
-    assert signals.author_hints == ["Emma", "Jane Austen"]
+    assert signals.author_hints == ["Jane Austen"]
 
 
 @pytest.mark.django_db

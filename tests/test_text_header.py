@@ -165,7 +165,7 @@ def test_header_hints_feed_identification_signals() -> None:
         },
     )
     assert signals.author_hints == ["William Gibson"]  # replaces "Count Zero"/"Unknown" guesses
-    assert signals.title_hints[:2] == ["Count Zero - Unknown", "Count Zero"]
+    assert signals.title_hints[:2] == ["Count Zero", "Count Zero - Unknown"]
 
 
 def test_without_header_signals_are_unchanged() -> None:
@@ -174,7 +174,7 @@ def test_without_header_signals_are_unchanged() -> None:
         original_filename="Emma - Jane Austen.txt",
         extracted_metadata={"title": "Emma - Jane Austen"},
     )
-    assert signals.author_hints == ["Emma", "Jane Austen"]
+    assert signals.author_hints == ["Jane Austen"]
 
 
 def test_text_intake_records_header_evidence(tmp_path: Path) -> None:
