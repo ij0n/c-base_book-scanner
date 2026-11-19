@@ -1,5 +1,31 @@
 import interact from "interactjs";
 
+import {
+  applyClick,
+  neighbour,
+  PageStrip,
+  sortItems,
+  type SortMode,
+  type StripItem,
+} from "./page-strip";
+import {
+  ContentBoxOverlay,
+  describeContent,
+  type SourceBox,
+} from "./content-box-view";
+import { DewarpOverlay, describeDewarp, XSpline, type Pt } from "./dewarp-view";
+import {
+  type ApplyScope,
+  applyScopePages,
+  clampAngle,
+  DeskewOverlay,
+  deskewResultText,
+  describeAngle,
+  roundAngle,
+  wheelAngle,
+} from "./deskew-view";
+import { fitView, panBy, type View, wheelFactor, zoomAt } from "./pan-zoom";
+
 /** Pipeline order (#195). There is no Fix Orientation and no Page Split stage. */
 export const STAGE_ORDER = [
   "deskew",
@@ -29,13 +55,15 @@ interface StageState {
   output_sha256?: string;
   last_error: string;
   invalidated_reason?: string;
+  manual?: boolean;
 }
 
 interface WorkspacePage {
   id: string;
-  active_version?: { id?: string };
+  active_version?: { id?: string; original_filename?: string };
   logical_sequence_number: number;
   side: string;
+  recognized_page_number?: string | null;
   thumbnail?: string;
   /** Token of the first stage's input (the working image); empty while it is generated. */
   work_image_token?: string;
@@ -84,7 +112,7 @@ const STAGE_LABELS: Record<StageName, string> = {
 };
 
 const EDITABLE_KEYS: Record<StageName, readonly string[]> = {
-  deskew: ["manual_angle", "angle_min", "angle_max", "angle_step"],
+  deskew: ["manual_angle"],
   select_content: ["content_mode", "content_box"],
   margins: [
     "margins_mode",
@@ -98,7 +126,7 @@ const EDITABLE_KEYS: Record<StageName, readonly string[]> = {
     "align_x",
     "align_y",
   ],
-  dewarping: ["dewarp_mode", "dewarp_model", "dewarp_points", "dewarp_curves"],
+  dewarping: ["dewarp_mode", "depth_perception", "top_curve", "bottom_curve"],
   output: [
     "output_mode",
     "keep_color",
@@ -175,27 +203,6 @@ export function editableParameters(stage: StageName, parameters: JsonObject): Js
 }
 
 /** Explicitly copy only baseline geometry when an operator starts manual editing. */
-export function curvatureCurvesForEditing(parameters: JsonObject): number[][][] {
-  const raw =
-    parameters.dewarp_mode === "manual" ? parameters.dewarp_curves : parameters.curvature_curves;
-  if (!Array.isArray(raw)) return [];
-  return raw.slice(0, 32).flatMap((curve): number[][][] => {
-    if (
-      !Array.isArray(curve) ||
-      curve.length < 3 ||
-      curve.length > 17 ||
-      !curve.every(
-        (point) =>
-          Array.isArray(point) &&
-          point.length === 2 &&
-          point.every((value) => typeof value === "number" && Number.isFinite(value)),
-      )
-    )
-      return [];
-    return [curve.map((point) => [...point] as number[])];
-  });
-}
-
 export interface OutputZone {
   kind: "text" | "picture";
   box: number[];
@@ -231,11 +238,6 @@ export function outputZonesForEditing(parameters: JsonObject): OutputZone[] {
 export function stageWorkerWarnings(parameters: JsonObject): string {
   return [parameters.dewarp_warning, parameters.output_warning]
     .filter((warning): warning is string => typeof warning === "string" && warning.trim() !== "")
-    .map((warning) =>
-      warning === "auto_detection_found_no_text_lines_or_page_outline"
-        ? "Automatic dewarping found no reliable text lines or page outline; the input was kept unchanged."
-        : warning,
-    )
     .join(" · ");
 }
 
@@ -363,6 +365,47 @@ export function artifactToken(
   return `${state.revision}-${state.output_sha256.slice(0, 16)}`;
 }
 
+/** Fill ``__PAGE__``/``__STAGE__`` placeholders of a URL template from the page. */
+export function fillUrl(template: string, pageId: string, stage = ""): string {
+  return template.replace("__PAGE__", pageId).replace("__STAGE__", stage);
+}
+
+/**
+ * The stage whose output the page strip shows for ``stage``: that stage when it has
+ * a result, else the last completed stage before it (unbroken from the first).
+ */
+export function stripSourceStage(
+  page: Pick<WorkspacePage, "stages">,
+  stage: StageName,
+): StageState | undefined {
+  let latest: StageState | undefined;
+  for (const name of STAGE_ORDER) {
+    const state = page.stages.find((candidate) => candidate.stage === name);
+    if (!state || state.status !== "success" || !artifactToken(state)) break;
+    latest = state;
+    if (name === stage) break;
+  }
+  return latest;
+}
+
+/** Full-resolution size of a page at ``stage`` for the width/height orders. */
+export function stageSize(
+  page: Pick<WorkspacePage, "stages">,
+  stage: StageName,
+): { width: number | null; height: number | null } {
+  const state = page.stages.find((candidate) => candidate.stage === stage);
+  const parameters = state?.parameters ?? {};
+  const width =
+    stage === "select_content"
+      ? positiveNumber(parameters.content_area_width)
+      : positiveNumber(parameters.output_width);
+  const height =
+    stage === "select_content"
+      ? positiveNumber(parameters.content_area_height)
+      : positiveNumber(parameters.output_height);
+  return { width, height };
+}
+
 /** Short status shown in the page list for a stage. */
 export function stageStatusLabel(state: Pick<StageState, "status">): string {
   return state.status;
@@ -448,6 +491,25 @@ function element<T extends HTMLElement>(parent: ParentNode, selector: string): T
   return found;
 }
 
+const KEEP_GRID_KEY = "scantailor.deskew.keepGrid";
+
+/** Per-viewer preference; storage may be unavailable (private windows). */
+function readKeepGrid(): boolean {
+  try {
+    return window.localStorage.getItem(KEEP_GRID_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function writeKeepGrid(keep: boolean): void {
+  try {
+    window.localStorage.setItem(KEEP_GRID_KEY, String(keep));
+  } catch {
+    // The preference is a convenience only.
+  }
+}
+
 class WorkspaceController {
   private readonly root: HTMLElement;
   private readonly pages = new Map<string, WorkspacePage>();
@@ -470,16 +532,32 @@ class WorkspaceController {
   private previewMode: "input" | "result" = "input";
   private activePageId: string | null = null;
   private activeStage: StageName = STAGE_ORDER[0];
-  private activeCurvatureCurve = 0;
   private draft: JsonObject = {};
   private interactions: InteractableHandle[] = [];
   private eventSource: EventSource | null = null;
   private pollingTimer: number | null = null;
   private pollCursor: string | null = null;
+  private readonly viewport: HTMLElement | null;
+  private readonly surface: HTMLElement | null;
+  private readonly zoomLevel: HTMLElement | null;
+  private readonly statusHint: HTMLElement | null;
+  private readonly sortSelect: HTMLSelectElement | null;
+  private readonly keepInView: HTMLInputElement | null;
+  private readonly strip: PageStrip | null;
+  private readonly naturalOrder: string[];
+  private view: View = { zoom: 1, x: 0, y: 0 };
+  private fitPending = true;
+  private selectionAnchor: string | null = null;
   /** The preview URL being shown, without the cache-busting retry marker. */
   private previewUrl = "";
   private previewRetry: PreviewRetryState = INITIAL_PREVIEW_RETRY;
   private previewRetryTimer: number | null = null;
+  private deskewOverlay: DeskewOverlay | null = null;
+  private contentOverlay: ContentBoxOverlay | null = null;
+  private dewarpOverlay: DewarpOverlay | null = null;
+  private deskewSaveTimer: number | null = null;
+  private saving = false;
+  private saveQueued = false;
 
   constructor(root: HTMLElement, pages: WorkspacePage[]) {
     this.root = root;
@@ -501,13 +579,37 @@ class WorkspaceController {
     for (const page of pages) {
       this.pages.set(page.id, page);
     }
+    this.naturalOrder = pages.map((page) => page.id);
+    this.viewport = root.querySelector<HTMLElement>("[data-viewport]");
+    this.surface = root.querySelector<HTMLElement>("[data-surface]");
+    this.zoomLevel = root.querySelector<HTMLElement>("[data-zoom-level]");
+    this.statusHint = root.querySelector<HTMLElement>("[data-status-hint]");
+    this.sortSelect = root.querySelector<HTMLSelectElement>("[data-strip-sort]");
+    this.keepInView = root.querySelector<HTMLInputElement>("[data-keep-in-view]");
+    const scroller = root.querySelector<HTMLElement>("[data-strip-scroll]");
+    this.strip = scroller
+      ? new PageStrip(scroller, {
+          onClick: (pageId, modifiers) => this.clickPage(pageId, modifiers),
+        })
+      : null;
+  }
+
+  private url(name: string, pageId = "", stage = ""): string {
+    return fillUrl(this.root.dataset[name] ?? "", pageId, stage);
   }
 
   start(): void {
     this.bindWorkspaceControls();
-    const firstPage = this.pages.values().next().value as WorkspacePage | undefined;
+    // The job overview links "Edit" as ?page=<id>&stage=<stage>.
+    const query = new URLSearchParams(window.location.search);
+    const requestedPage = query.get("page") ?? "";
+    const requestedStage = query.get("stage") ?? "";
+    const firstPage = this.pages.get(requestedPage) ?? this.pages.values().next().value;
     if (firstPage) {
-      this.activate(firstPage.id, STAGE_ORDER[0]);
+      this.activate(
+        firstPage.id,
+        isStageName(requestedStage) ? requestedStage : STAGE_ORDER[0],
+      );
     } else {
       this.disableEditor("Upload a page to begin editing.");
     }
@@ -525,51 +627,24 @@ class WorkspaceController {
         if (typeof pageId === "string") this.activate(pageId, value);
       });
     });
-    this.root.querySelectorAll<HTMLButtonElement>("[data-stage-open]").forEach((button) => {
+    this.root.querySelectorAll<HTMLButtonElement>("[data-stage-run-all]").forEach((button) => {
       button.addEventListener("click", () => {
-        const pageId = button.dataset.pageId;
-        const value = button.dataset.stage;
-        if (pageId && value && isStageName(value)) this.activate(pageId, value);
+        const value = button.dataset.stageRunAll ?? "";
+        if (isStageName(value)) void this.runStageForAllPages(value, button);
       });
     });
-    this.root.querySelectorAll<HTMLInputElement>("[data-page-select]").forEach((checkbox) => {
-      checkbox.addEventListener("change", () => {
-        const pageId = checkbox.dataset.pageId;
-        if (!pageId) return;
-        if (checkbox.checked) this.selectedPages.add(pageId);
-        else this.selectedPages.delete(pageId);
-        this.updateSelectionCount();
-      });
-    });
-    element<HTMLButtonElement>(this.root, "[data-select-all]").addEventListener("click", () => {
-      this.root.querySelectorAll<HTMLInputElement>("[data-page-select]").forEach((checkbox) => {
-        checkbox.checked = true;
-        const pageId = checkbox.dataset.pageId;
-        if (pageId) this.selectedPages.add(pageId);
-      });
-      this.updateSelectionCount();
-    });
-    element<HTMLButtonElement>(this.root, "[data-clear-selection]").addEventListener(
-      "click",
-      () => {
-        this.root.querySelectorAll<HTMLInputElement>("[data-page-select]").forEach((checkbox) => {
-          checkbox.checked = false;
-        });
-        this.selectedPages.clear();
-        this.updateSelectionCount();
-      },
-    );
     this.saveButton.addEventListener("click", () => void this.saveActiveStage());
     this.batchButton.addEventListener("click", () => void this.applyBatch());
+    this.bindCanvas();
+    this.bindStrip();
     this.batchScope.addEventListener("change", () => this.updateSelectionCount());
     this.image.addEventListener("load", () => {
-      if (
-        this.activeStage === "dewarping" &&
-        this.draft.dewarp_model === "curvature" &&
-        this.draft.dewarp_mode === "manual" &&
-        curvatureCurvesForEditing(this.draft).length < 2
-      )
-        this.renderControls();
+      if (this.fitPending) {
+        this.fitPending = false;
+        this.fitToPane();
+      } else {
+        this.applyView();
+      }
       this.renderGeometry();
       if (this.previewRetry !== INITIAL_PREVIEW_RETRY) {
         // Recovered after a retry: replace the "being prepared" note.
@@ -581,7 +656,9 @@ class WorkspaceController {
         }
       }
     });
-    window.addEventListener("resize", () => this.renderGeometry());
+    window.addEventListener("resize", () => {
+      this.fitToPane();
+    });
     this.image.addEventListener("error", () => {
       this.clearGeometry();
       void this.explainPreviewFailure(this.image.src, this.activeStage);
@@ -650,9 +727,22 @@ class WorkspaceController {
     const page = this.pages.get(pageId);
     const state = page ? stageFor(page, stage) : undefined;
     if (!page || !state) return;
+    const stageChanged = stage !== this.activeStage;
+    if (pageId !== this.activePageId || stageChanged) this.fitPending = true;
     this.activePageId = pageId;
     this.activeStage = stage;
+    if (!this.selectedPages.has(pageId)) {
+      this.selectedPages.clear();
+      this.selectedPages.add(pageId);
+      this.selectionAnchor = pageId;
+    }
     this.draft = editableParameters(stage, state.parameters ?? {});
+    const hint = this.root.querySelector<HTMLElement>(`[data-stage-select="${stage}"]`)?.dataset
+      .hint;
+    if (this.statusHint) this.statusHint.textContent = hint ?? "";
+    if (stageChanged) this.refreshStrip();
+    this.strip?.setActive(pageId, new Set(this.selectedPages), this.keepInView?.checked ?? true);
+    this.updateSelectionCount();
     this.title.textContent = `Page ${page.logical_sequence_number} · ${STAGE_LABELS[stage]}`;
     this.markActiveControls();
     this.renderControls();
@@ -677,11 +767,12 @@ class WorkspaceController {
       this.previewMode === "input"
         ? "Processing-stage input preview"
         : "Processing-stage result preview";
-    const trigger = this.stageTrigger(context.page.id, state.stage);
-    const source =
-      this.previewMode === "result"
-        ? trigger?.dataset.outputPreviewUrl
-        : trigger?.dataset.inputPreviewUrl || context.page.thumbnail;
+    const preview = this.url("previewUrlTemplate", context.page.id, state.stage);
+    const source = preview
+      ? this.previewMode === "result"
+        ? preview
+        : `${preview}?input=true`
+      : "";
     this.image.hidden = !source;
     let url = "";
     if (source) {
@@ -710,6 +801,7 @@ class WorkspaceController {
     this.warnings.textContent = warning ? `Worker warning: ${warning}` : "";
     this.warnings.hidden = !warning;
     this.geometryLayer.hidden = this.previewMode === "result";
+    this.applyDeskewPreview();
     this.renderGeometry();
   }
 
@@ -718,6 +810,32 @@ class WorkspaceController {
     const justCompleted =
       state.status === "success" &&
       (previous?.status !== "success" || previous.revision !== state.revision);
+    if (state.stage === "deskew") {
+      // The input view already shows the rotation live; stay there and show the result.
+      this.showPreview(this.previewMode);
+      this.syncDeskewControls();
+      if (justCompleted) this.setMessage(deskewResultText(state.parameters), "success");
+      return;
+    }
+    if (state.stage === "dewarping") {
+      if (this.dewarpOverlay?.isDragging()) return;
+      this.showPreview(this.previewMode);
+      const result = this.controls.querySelector<HTMLElement>("[data-dewarp-result]");
+      if (result && state.status === "success") result.textContent = describeDewarp(state.parameters);
+      if (justCompleted) this.setMessage(describeDewarp(state.parameters), "success");
+      return;
+    }
+    if (state.stage === "select_content") {
+      // The input view shows the content box; keep it unless a drag is in progress.
+      if (this.contentOverlay?.isDragging()) return;
+      this.showPreview(this.previewMode);
+      this.updateContentText();
+      if (justCompleted) {
+        const box = this.contentBox();
+        this.setMessage(describeContent(state.parameters, box, this.contentDpi()), "success");
+      }
+      return;
+    }
     this.showPreview(justCompleted ? "result" : this.previewMode);
     if (justCompleted) this.setMessage("Completed. Result preview is ready.", "success");
   }
@@ -726,18 +844,6 @@ class WorkspaceController {
     this.root.querySelectorAll<HTMLElement>("[data-stage-select]").forEach((item) => {
       item.classList.toggle("active", item.dataset.stageSelect === this.activeStage);
     });
-    this.root.querySelectorAll<HTMLElement>("[data-stage-open]").forEach((item) => {
-      item.classList.toggle(
-        "active",
-        item.dataset.stage === this.activeStage && item.dataset.pageId === this.activePageId,
-      );
-    });
-  }
-
-  private stageTrigger(pageId: string, stage: StageName): HTMLElement | null {
-    return this.root.querySelector<HTMLElement>(
-      `[data-stage-open][data-page-id="${pageId}"][data-stage="${stage}"]`,
-    );
   }
 
   private activeContext(): { page: WorkspacePage; state: StageState } | null {
@@ -769,28 +875,342 @@ class WorkspaceController {
   }
 
   private renderDeskewControls(): void {
-    const mode = "manual_angle" in this.draft ? "manual" : "auto";
-    this.addSelectValue("Mode", mode, ["auto", "manual"], (value) => {
-      if (value === "manual") {
-        const state = this.activeContext()?.state;
-        this.draft.manual_angle = finiteNumber(state?.parameters.angle, 0);
-      } else {
-        delete this.draft.manual_angle;
-      }
-      this.renderControls();
-      this.renderGeometry();
+    const state = this.activeContext()?.state;
+    const manual = "manual_angle" in this.draft;
+    const modes = document.createElement("fieldset");
+    modes.className = "st-radio-group";
+    const legend = document.createElement("legend");
+    legend.textContent = "Mode";
+    modes.append(legend);
+    for (const value of ["auto", "manual"] as const) {
+      const label = document.createElement("label");
+      label.className = "checkbox";
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "deskew-mode";
+      radio.value = value;
+      radio.checked = (value === "manual") === manual;
+      radio.disabled = !this.editable;
+      radio.dataset.deskewMode = value;
+      radio.addEventListener("change", () => {
+        if (!radio.checked) return;
+        if (value === "manual") {
+          this.setDeskewAngle(this.deskewAngle(), false);
+        } else {
+          // Upstream clears the page's parameters and detects again.
+          delete this.draft.manual_angle;
+          this.applyDeskewPreview();
+        }
+        void this.commitDraft();
+      });
+      label.append(radio, document.createTextNode(value === "auto" ? "Auto" : "Manual"));
+      modes.append(label);
+    }
+    this.controls.append(modes);
+
+    const label = document.createElement("label");
+    label.textContent = "Angle (degrees, + = clockwise)";
+    const input = document.createElement("input");
+    input.type = "number";
+    input.step = "0.01";
+    input.min = "-45";
+    input.max = "45";
+    input.dataset.deskewAngle = "";
+    input.disabled = !this.editable;
+    input.value = this.deskewAngle().toFixed(2);
+    input.title =
+      "Mouse wheel: 0.1° per notch (Shift: 0.05°). Ctrl+wheel over the page also rotates.";
+    input.addEventListener("input", () => {
+      const value = Number(input.value);
+      if (input.value === "" || !Number.isFinite(value)) return;
+      this.deskewOverlay?.flashGrid();
+      this.setDeskewAngle(clampAngle(value), true, false);
     });
-    if ("manual_angle" in this.draft) {
-      this.addNumber("Angle (degrees)", "manual_angle", -15, 15, 0.05);
-    } else {
-      this.addNumber("Auto minimum", "angle_min", -15, 0, 0.25, -7);
-      this.addNumber("Auto maximum", "angle_max", 0, 15, 0.25, 7);
-      this.addNumber("Search step", "angle_step", 0.05, 5, 0.05, 1);
+    input.addEventListener(
+      "wheel",
+      (event) => {
+        if (input.disabled) return;
+        event.preventDefault();
+        // A number field goes up when the wheel goes up.
+        const angle = wheelAngle(this.deskewAngle(), {
+          deltaY: -(event.deltaY || event.deltaX),
+          ctrlKey: true,
+          shiftKey: event.shiftKey,
+        });
+        if (angle === null) return;
+        this.deskewOverlay?.flashGrid();
+        this.setDeskewAngle(angle, true);
+      },
+      { passive: false },
+    );
+    label.append(input);
+    this.controls.append(label);
+
+    const grid = document.createElement("label");
+    grid.className = "checkbox";
+    const keep = document.createElement("input");
+    keep.type = "checkbox";
+    keep.dataset.deskewGrid = "";
+    keep.checked = readKeepGrid();
+    keep.addEventListener("change", () => {
+      writeKeepGrid(keep.checked);
+      this.deskewOverlay?.setKeepGrid(keep.checked);
+    });
+    grid.append(keep, document.createTextNode("Keep the grid visible"));
+    this.controls.append(grid);
+
+    const result = document.createElement("p");
+    result.className = "st-stage-result";
+    result.dataset.deskewResult = "";
+    result.textContent = state?.status === "success" ? deskewResultText(state.parameters) : "";
+    this.controls.append(result);
+  }
+
+  /** The angle shown: the manual draft, else what auto mode applied last. */
+  private deskewAngle(): number {
+    if ("manual_angle" in this.draft) return roundAngle(finiteNumber(this.draft.manual_angle, 0));
+    const state = this.activeContext()?.state;
+    return state ? roundAngle(finiteNumber(state.parameters.angle, 0)) : 0;
+  }
+
+  private deskewEditing(): boolean {
+    return (
+      this.editable &&
+      this.activeStage === "deskew" &&
+      this.previewMode === "input" &&
+      !this.image.hidden
+    );
+  }
+
+  /**
+   * Change the angle: the page turns at once in the browser. ``commit`` saves it after
+   * a short pause (upstream commits when a drag ends or the spin box changes).
+   */
+  private setDeskewAngle(angle: number, commit: boolean, updateField = true): void {
+    const rounded = roundAngle(angle);
+    const wasManual = "manual_angle" in this.draft;
+    this.draft.manual_angle = rounded;
+    if (!wasManual) {
+      const radio = this.controls.querySelector<HTMLInputElement>('[data-deskew-mode="manual"]');
+      if (radio) radio.checked = true;
+    }
+    if (updateField) {
+      const field = this.controls.querySelector<HTMLInputElement>("[data-deskew-angle]");
+      if (field) field.value = rounded.toFixed(2);
+    }
+    const result = this.controls.querySelector<HTMLElement>("[data-deskew-result]");
+    if (result) result.textContent = `${describeAngle(rounded)} (manual, not saved yet).`;
+    this.applyDeskewPreview();
+    if (commit) this.scheduleDeskewCommit();
+  }
+
+  private scheduleDeskewCommit(): void {
+    if (this.deskewSaveTimer !== null) window.clearTimeout(this.deskewSaveTimer);
+    this.deskewSaveTimer = window.setTimeout(() => {
+      this.deskewSaveTimer = null;
+      void this.commitDraft();
+    }, 600);
+  }
+
+  /** Save the stage draft; a change made while a save is running is saved after it. */
+  private async commitDraft(): Promise<void> {
+    if (!this.editable) return;
+    if (this.deskewSaveTimer !== null) {
+      window.clearTimeout(this.deskewSaveTimer);
+      this.deskewSaveTimer = null;
+    }
+    if (this.saving) {
+      this.saveQueued = true;
+      return;
+    }
+    await this.saveActiveStage();
+    if (this.saveQueued) {
+      this.saveQueued = false;
+      await this.commitDraft();
     }
   }
 
+  /** Field and result text after a run (unless the member is changing the angle). */
+  private syncDeskewControls(): void {
+    if (this.activeStage !== "deskew") return;
+    const state = this.activeContext()?.state;
+    if (!state) return;
+    const field = this.controls.querySelector<HTMLInputElement>("[data-deskew-angle]");
+    const editing =
+      this.deskewSaveTimer !== null ||
+      this.saving ||
+      this.deskewOverlay?.isDragging() === true ||
+      (field !== null && document.activeElement === field);
+    if (editing) return;
+    if (!("manual_angle" in this.draft) && field) field.value = this.deskewAngle().toFixed(2);
+    const result = this.controls.querySelector<HTMLElement>("[data-deskew-result]");
+    if (result && state.status === "success") result.textContent = deskewResultText(state.parameters);
+    this.applyDeskewPreview();
+  }
+
+  /** Turn the input preview by the current angle and place the grid and handles. */
+  private applyDeskewPreview(): void {
+    const active =
+      this.activeStage === "deskew" && this.previewMode === "input" && !this.image.hidden;
+    if (!active || !this.viewport || !this.image.naturalWidth) {
+      this.image.style.transform = "";
+      if (this.deskewOverlay) this.deskewOverlay.element.style.display = "none";
+      return;
+    }
+    const angle = this.deskewAngle();
+    this.image.style.transformOrigin = "50% 50%";
+    this.image.style.transform = angle ? `rotate(${angle}deg)` : "";
+    if (!this.deskewOverlay) {
+      this.deskewOverlay = new DeskewOverlay(this.viewport, {
+        onPreview: (value) => this.setDeskewAngle(value, false),
+        onCommit: (value) => {
+          this.setDeskewAngle(value, false);
+          void this.commitDraft();
+        },
+      });
+      this.deskewOverlay.setKeepGrid(readKeepGrid());
+    }
+    const overlay = this.deskewOverlay;
+    overlay.element.style.display = "";
+    overlay.element.classList.toggle("read-only", !this.editable);
+    const width = this.image.naturalWidth * this.view.zoom;
+    const height = this.image.naturalHeight * this.view.zoom;
+    const centre = { x: this.view.x + width / 2, y: this.view.y + height / 2 };
+    // Handles sit at the page edges, but stay inside the pane.
+    const radius = Math.max(
+      24,
+      Math.min(
+        width / 2,
+        this.viewport.clientWidth / 2 - 16,
+        this.viewport.clientHeight / 2 - 16,
+      ),
+    );
+    overlay.layout(centre, radius, angle);
+  }
+
   private renderContentControls(): void {
-    this.addSelect("Mode", "content_mode", ["auto", "manual"], "auto", true);
+    const state = this.activeContext()?.state;
+    const mode = String(this.draft.content_mode ?? state?.parameters.content_mode ?? "auto");
+    const modes = document.createElement("fieldset");
+    modes.className = "st-radio-group";
+    const legend = document.createElement("legend");
+    legend.textContent = "Mode";
+    modes.append(legend);
+    for (const [value, text] of [
+      ["auto", "Auto"],
+      ["manual", "Manual"],
+      ["disabled", "Disabled"],
+    ] as const) {
+      const label = document.createElement("label");
+      label.className = "checkbox";
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "content-mode";
+      radio.value = value;
+      radio.checked = mode === value;
+      radio.disabled = !this.editable;
+      radio.dataset.contentMode = value;
+      radio.addEventListener("change", () => {
+        if (!radio.checked) return;
+        this.draft.content_mode = value;
+        if (value === "manual") {
+          // Start from the box on screen (the auto result), as upstream does.
+          const box = this.contentBox() ?? this.defaultContentBox();
+          this.draft.content_box = [box.x1, box.y1, box.x2, box.y2];
+        } else {
+          delete this.draft.content_box;
+        }
+        this.renderGeometry();
+        void this.commitDraft();
+      });
+      label.append(radio, document.createTextNode(text));
+      modes.append(label);
+    }
+    this.controls.append(modes);
+    const result = document.createElement("p");
+    result.className = "st-stage-result";
+    result.dataset.contentResult = "";
+    this.controls.append(result);
+    this.updateContentText();
+  }
+
+  /** The box to draw: the manual draft, else what auto mode found last. */
+  private contentBox(): SourceBox | null {
+    const state = this.activeContext()?.state;
+    const mode = String(this.draft.content_mode ?? state?.parameters.content_mode ?? "auto");
+    if (mode === "disabled") return null;
+    const fallback = { x1: 0, y1: 0, x2: 0, y2: 0 };
+    if (mode === "manual" && this.draft.content_box !== undefined) {
+      const box = normalizeBox(this.draft.content_box, fallback);
+      return box.x2 > box.x1 && box.y2 > box.y1 ? box : null;
+    }
+    if (!state || state.status !== "success" || state.parameters.content_found === false)
+      return null;
+    const box = normalizeBox(state.parameters.content_box, fallback);
+    return box.x2 > box.x1 && box.y2 > box.y1 ? box : null;
+  }
+
+  /** Upstream `createContentBox`: 70 % of the page, centred. */
+  private defaultContentBox(): SourceBox {
+    const source = this.sourceSize();
+    return {
+      x1: Math.round(source.width * 0.15),
+      y1: Math.round(source.height * 0.15),
+      x2: Math.round(source.width * 0.85),
+      y2: Math.round(source.height * 0.85),
+    };
+  }
+
+  private contentDpi(): { x: number; y: number } | null {
+    const dpi = this.activeContext()?.state.parameters.dpi;
+    if (Array.isArray(dpi) && dpi.length >= 2) {
+      const x = positiveNumber(dpi[0]);
+      const y = positiveNumber(dpi[1]);
+      if (x && y) return { x, y };
+    }
+    return null;
+  }
+
+  private updateContentText(box: SourceBox | null = this.contentBox()): void {
+    const result = this.controls.querySelector<HTMLElement>("[data-content-result]");
+    if (!result) return;
+    const state = this.activeContext()?.state;
+    const parameters = { ...(state?.parameters ?? {}), ...this.draft };
+    const known = state?.status === "success" || this.draft.content_mode === "manual";
+    result.textContent = known ? describeContent(parameters, box, this.contentDpi()) : "";
+  }
+
+  /**
+   * Draw the content box. The overlay persists across re-renders (live updates,
+   * zoom, image reloads), like the Deskew overlay, so a drag in progress survives them.
+   */
+  private renderContentBox(source: Size, display: Size): void {
+    const box = this.contentBox();
+    const existing = this.contentOverlay;
+    if (existing && (box || existing.isDragging())) {
+      if (box) existing.setBox(box); // ignored while dragging
+      if (existing.element.parentElement !== this.geometryLayer)
+        this.geometryLayer.append(existing.element);
+      existing.layout(source, display);
+      return;
+    }
+    this.removeContentOverlay();
+    if (!box) return;
+    this.contentOverlay = new ContentBoxOverlay(this.geometryLayer, box, this.editable, {
+      onPreview: (next) => this.updateContentText(next),
+      onCommit: (next) => {
+        // Upstream manualContentRectSet: a drag makes the box manual and commits it.
+        this.draft.content_mode = "manual";
+        this.draft.content_box = [next.x1, next.y1, next.x2, next.y2];
+        const radio = this.controls.querySelector<HTMLInputElement>(
+          '[data-content-mode="manual"]',
+        );
+        if (radio) radio.checked = true;
+        this.updateContentText(next);
+        void this.commitDraft();
+      },
+    });
+    this.contentOverlay.layout(source, display);
   }
 
   private renderMarginControls(): void {
@@ -800,111 +1220,141 @@ class WorkspaceController {
   }
 
   private renderDewarpControls(): void {
-    const model = this.draft.dewarp_model === "curvature" ? "curvature" : "perspective";
-    this.draft.dewarp_model = model;
-    this.addSelectValue("Dewarp model", model, ["perspective", "curvature"], (value) => {
-      this.draft.dewarp_model = value;
-      if (value === "perspective") delete this.draft.dewarp_curves;
-      else delete this.draft.dewarp_points;
-      this.renderControls();
-      this.showPreview("input");
-    });
-    const mode = String(this.draft.dewarp_mode ?? "auto");
-    this.draft.dewarp_mode = mode;
-    this.addSelectValue("Mode", mode, ["auto", "manual", "bypass"], (value) => {
-      this.draft.dewarp_mode = value;
-      if (value !== "manual") {
-        delete this.draft.dewarp_curves;
-        delete this.draft.dewarp_points;
-      }
-      this.renderControls();
-      this.showPreview("input");
-    });
-    if (model !== "curvature") return;
-    const note = document.createElement("p"); note.className = "muted";
-    note.textContent = "Opt-in baseline correction: inspect the Result preview before finishing.";
-    this.controls.append(note);
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = "Edit detected baselines";
-    button.addEventListener("click", () => {
-      this.draft.dewarp_curves = curvatureCurvesForEditing(
-        this.activeContext()?.state.parameters ?? {},
-      );
-      this.draft.dewarp_mode = "manual";
-      this.renderControls();
-      this.showPreview("input");
-    });
-    this.controls.append(button);
-    if (mode !== "manual") return;
-    let curves = curvatureCurvesForEditing(this.draft);
-    const size = this.sourceSize();
-    if (curves.length < 2 && size.width > 2 && size.height > 10) {
-      curves = [0.25, 0.75].map((ratio) => [
-        [0, size.height * ratio],
-        [size.width / 2, size.height * ratio],
-        [size.width - 1, size.height * ratio],
-      ]);
-    }
-    this.draft.dewarp_curves = curves;
-    if (curves.length < 2) return;
-    this.activeCurvatureCurve = Math.min(this.activeCurvatureCurve, curves.length - 1);
-    this.addSelectValue(
-      "Baseline",
-      String(this.activeCurvatureCurve + 1),
-      curves.map((_, index) => String(index + 1)),
-      (value) => {
-        this.activeCurvatureCurve = Number(value) - 1;
-        this.renderControls();
-        this.renderGeometry();
-      },
-    );
-    curves[this.activeCurvatureCurve]!.forEach((point, index) => {
+    const state = this.activeContext()?.state;
+    const mode = String(this.draft.dewarp_mode ?? state?.parameters.dewarp_mode ?? "auto");
+    const modes = document.createElement("fieldset");
+    modes.className = "st-radio-group";
+    const legend = document.createElement("legend");
+    legend.textContent = "Mode";
+    modes.append(legend);
+    for (const [value, text] of [
+      ["off", "Off"],
+      ["auto", "Auto"],
+      ["manual", "Manual"],
+    ] as const) {
       const label = document.createElement("label");
-      label.textContent = `Baseline point ${index + 1} y`;
-      const input = document.createElement("input");
-      input.type = "number";
-      input.min = "0";
-      input.max = String(size.height - 1);
-      input.step = "0.1";
-      input.value = String(point[1]);
-      input.addEventListener("change", () => {
-        point[1] = clamp(finiteNumber(input.value, point[1] ?? 0), 0, size.height - 1);
-        this.renderGeometry();
-      });
-      label.append(input);
-      this.controls.append(label);
-    });
-    for (const action of ["Add baseline", "Remove baseline"]) {
-      const control = document.createElement("button");
-      control.type = "button";
-      control.textContent = action;
-      control.disabled = action === "Add baseline" ? curves.length >= 32 : curves.length <= 2;
-      control.addEventListener("click", () => {
-        if (action === "Remove baseline") curves.splice(this.activeCurvatureCurve, 1);
-        else {
-          const ys = curves
-            .map((curve) => curve[Math.floor(curve.length / 2)]![1]!)
-            .sort((a, b) => a - b);
-          let y = size.height / 2;
-          let gap = 0;
-          for (let i = 1; i < ys.length; i++)
-            if (ys[i]! - ys[i - 1]! > gap) {
-              gap = ys[i]! - ys[i - 1]!;
-              y = (ys[i]! + ys[i - 1]!) / 2;
-            }
-          curves.push([
-            [0, y],
-            [size.width / 2, y],
-            [size.width - 1, y],
-          ]);
-          this.activeCurvatureCurve = curves.length - 1;
+      label.className = "checkbox";
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "dewarp-mode";
+      radio.value = value;
+      radio.checked = mode === value || (value === "off" && mode === "bypass");
+      radio.disabled = !this.editable;
+      radio.dataset.dewarpMode = value;
+      radio.addEventListener("change", () => {
+        if (!radio.checked) return;
+        this.draft.dewarp_mode = value;
+        if (value === "manual") {
+          // Start from the curves on screen (the auto result), as upstream does.
+          const curves = this.dewarpCurves();
+          this.draft.top_curve = curves.top.points.map(([x, y]) => [x, y]);
+          this.draft.bottom_curve = curves.bottom.points.map(([x, y]) => [x, y]);
+        } else {
+          delete this.draft.top_curve;
+          delete this.draft.bottom_curve;
         }
-        this.renderControls();
         this.renderGeometry();
+        void this.commitDraft();
       });
-      this.controls.append(control);
+      label.append(radio, document.createTextNode(text));
+      modes.append(label);
     }
+    this.controls.append(modes);
+
+    // Upstream's depth perception slider (1 to 3, default 2).
+    const label = document.createElement("label");
+    label.textContent = "Depth perception";
+    const slider = document.createElement("input");
+    slider.type = "range";
+    slider.min = "1";
+    slider.max = "3";
+    slider.step = "0.1";
+    slider.dataset.depthPerception = "";
+    slider.disabled = !this.editable;
+    slider.value = String(finiteNumber(this.draft.depth_perception ?? state?.parameters.depth_perception, 2));
+    slider.addEventListener("input", () => {
+      this.draft.depth_perception = Number(slider.value);
+      if (this.dewarpOverlay) {
+        this.dewarpOverlay.depth = Number(slider.value);
+        this.dewarpOverlay.draw();
+      }
+    });
+    slider.addEventListener("change", () => void this.commitDraft());
+    label.append(slider);
+    this.controls.append(label);
+
+    const result = document.createElement("p");
+    result.className = "st-stage-result";
+    result.dataset.dewarpResult = "";
+    result.textContent = state?.status === "success" ? describeDewarp(state.parameters) : "";
+    this.controls.append(result);
+  }
+
+  /** The curves to show: the manual draft, else the last run's, else a flat model. */
+  private dewarpCurves(): { top: XSpline; bottom: XSpline } {
+    const state = this.activeContext()?.state;
+    const parameters = state?.parameters ?? {};
+    const points = (value: unknown): Pt[] | null => {
+      if (!Array.isArray(value) || value.length < 2) return null;
+      const out: Pt[] = [];
+      for (const item of value) {
+        if (!Array.isArray(item) || item.length < 2) return null;
+        const x = Number(item[0]);
+        const y = Number(item[1]);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+        out.push([x, y]);
+      }
+      return out;
+    };
+    const manual = String(this.draft.dewarp_mode ?? "") === "manual";
+    const top = points(manual ? this.draft.top_curve : parameters.top_curve) ?? points(parameters.top_curve);
+    const bottom =
+      points(manual ? this.draft.bottom_curve : parameters.bottom_curve) ?? points(parameters.bottom_curve);
+    if (top && bottom) return { top: new XSpline(top), bottom: new XSpline(bottom) };
+    // Upstream initNewSpline on the content box: five points along each edge.
+    const source = this.sourceSize();
+    const line = (y: number): Pt[] =>
+      [0, 0.25, 0.5, 0.75, 1].map((f) => [f * source.width, y] as Pt);
+    return { top: new XSpline(line(0)), bottom: new XSpline(line(source.height)) };
+  }
+
+  private renderDewarpOverlay(source: Size, display: Size): void {
+    const state = this.activeContext()?.state;
+    const mode = String(this.draft.dewarp_mode ?? state?.parameters.dewarp_mode ?? "auto");
+    if (mode === "off" || mode === "bypass") {
+      this.removeDewarpOverlay();
+      return;
+    }
+    const depth = finiteNumber(this.draft.depth_perception ?? state?.parameters.depth_perception, 2);
+    const curves = this.dewarpCurves();
+    const existing = this.dewarpOverlay;
+    if (existing) {
+      existing.setCurves(curves.top, curves.bottom, depth); // ignored while dragging
+      if (existing.element.parentElement !== this.geometryLayer)
+        this.geometryLayer.append(existing.element);
+      existing.layout(source, display);
+      return;
+    }
+    const overlay = new DewarpOverlay(this.geometryLayer, curves.top, curves.bottom, this.editable, {
+      onPreview: () => undefined,
+      onCommit: (top, bottom) => {
+        // Upstream dragFinished: an edited auto model becomes manual.
+        this.draft.dewarp_mode = "manual";
+        this.draft.top_curve = top.points.map(([x, y]) => [x, y]);
+        this.draft.bottom_curve = bottom.points.map(([x, y]) => [x, y]);
+        const radio = this.controls.querySelector<HTMLInputElement>('[data-dewarp-mode="manual"]');
+        if (radio) radio.checked = true;
+        void this.commitDraft();
+      },
+    });
+    overlay.depth = depth;
+    this.dewarpOverlay = overlay;
+    overlay.layout(source, display);
+  }
+
+  private removeDewarpOverlay(): void {
+    this.dewarpOverlay?.remove();
+    this.dewarpOverlay = null;
   }
 
   private renderOutputControls(): void {
@@ -1118,15 +1568,10 @@ class WorkspaceController {
     this.geometryLayer.style.height = `${display.height}px`;
     switch (this.activeStage) {
       case "select_content":
-        if (this.draft.content_mode === "manual") {
-          this.renderRectangle("content_box", "Content", "content", source, display, 0.08);
-        }
+        this.renderContentBox(source, display);
         break;
       case "dewarping":
-        if (this.draft.dewarp_mode === "manual") {
-          if (this.draft.dewarp_model === "curvature") this.renderCurvatureCurves(source, display);
-          else this.renderDewarpPoints(source, display);
-        }
+        this.renderDewarpOverlay(source, display);
         break;
       case "output": {
         const manual = this.draft.zone_mode === "manual";
@@ -1174,7 +1619,20 @@ class WorkspaceController {
   private clearGeometry(): void {
     for (const interaction of this.interactions) interaction.unset();
     this.interactions = [];
-    this.geometryLayer.replaceChildren();
+    // Keep the persistent overlays (and any drag on them); renderGeometry updates them.
+    const input = this.previewMode === "input";
+    const keepContent = input && this.activeStage === "select_content" ? this.contentOverlay : null;
+    const keepDewarp = input && this.activeStage === "dewarping" ? this.dewarpOverlay : null;
+    if (!keepContent) this.removeContentOverlay();
+    if (!keepDewarp) this.removeDewarpOverlay();
+    for (const child of [...this.geometryLayer.children]) {
+      if (child !== keepContent?.element && child !== keepDewarp?.element) child.remove();
+    }
+  }
+
+  private removeContentOverlay(): void {
+    this.contentOverlay?.remove();
+    this.contentOverlay = null;
   }
 
   private renderRectangle(
@@ -1275,142 +1733,12 @@ class WorkspaceController {
     };
   }
 
-  private renderCurvatureCurves(source: Size, display: Size): void {
-    const curves = this.draft.dewarp_curves as number[][][] | undefined;
-    if (!Array.isArray(curves)) return;
-    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    svg.classList.add("geometry-lines");
-    this.geometryLayer.append(svg);
-    curves.forEach((curve, curveIndex) => {
-      const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
-      line.setAttribute("fill", "none"); line.setAttribute("stroke", curveIndex === this.activeCurvatureCurve ? "#f9c74f" : "#90be6d"); line.setAttribute("stroke-width", "2");
-      svg.append(line);
-      const redraw = () =>
-        line.setAttribute(
-          "points",
-          curve
-            .map(
-              (p) =>
-                `${(p[0]! / source.width) * display.width},${(p[1]! / source.height) * display.height}`,
-            )
-            .join(" "),
-        );
-      redraw();
-      if (curveIndex !== this.activeCurvatureCurve) return;
-      curve.forEach((point, index) => {
-        const handle = document.createElement("div");
-        handle.className = "geometry-point";
-        handle.setAttribute("aria-label", `Baseline ${curveIndex + 1} control point ${index + 1}`);
-        const position = () => {
-          handle.style.left = `${(point[0]! / source.width) * display.width}px`;
-          handle.style.top = `${(point[1]! / source.height) * display.height}px`;
-        };
-        position();
-        this.geometryLayer.append(handle);
-        this.interactions.push(
-          interact(handle).draggable({
-            modifiers: [interact.modifiers.restrictRect({ restriction: "parent" })],
-            listeners: {
-              move: (event) => {
-                point[0] = clamp(
-                  point[0]! + (event.dx / display.width) * source.width,
-                  0,
-                  source.width - 1,
-                );
-                point[1] = clamp(
-                  point[1]! + (event.dy / display.height) * source.height,
-                  0,
-                  source.height - 1,
-                );
-                position();
-                redraw();
-              },
-              end: () => {
-                this.renderControls();
-                this.renderGeometry();
-              },
-            },
-          }),
-        );
-      });
-    });
-  }
-
-  private renderDewarpPoints(source: Size, display: Size): void {
-    const fallback: Point[] = [
-      { x: source.width * 0.05, y: source.height * 0.05 },
-      { x: source.width * 0.95, y: source.height * 0.05 },
-      { x: source.width * 0.95, y: source.height * 0.95 },
-      { x: source.width * 0.05, y: source.height * 0.95 },
-    ];
-    const points = this.normalizedPoints(this.draft.dewarp_points, fallback);
-    this.draft.dewarp_points = points.map((point) => [Math.round(point.x), Math.round(point.y)]);
-    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    svg.classList.add("geometry-lines");
-    const polygon = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
-    svg.append(polygon);
-    this.geometryLayer.append(svg);
-    const displayed = points.map((point) => ({
-      x: (point.x / source.width) * display.width,
-      y: (point.y / source.height) * display.height,
-    }));
-    const redraw = (): void => {
-      polygon.setAttribute("points", displayed.map((point) => `${point.x},${point.y}`).join(" "));
-      this.draft.dewarp_points = displayed.map((point) => [
-        Math.round((point.x / display.width) * source.width),
-        Math.round((point.y / display.height) * source.height),
-      ]);
-    };
-    displayed.forEach((point, index) => {
-      const handle = document.createElement("div");
-      handle.className = "geometry-point";
-      handle.style.left = `${point.x}px`;
-      handle.style.top = `${point.y}px`;
-      handle.setAttribute("aria-label", `Dewarp control point ${index + 1}`);
-      this.geometryLayer.append(handle);
-      const interaction = interact(handle).draggable({
-        modifiers: [interact.modifiers.restrictRect({ restriction: "parent" })],
-        listeners: {
-          move: (event) => {
-            point.x = clamp(point.x + event.dx, 0, display.width);
-            point.y = clamp(point.y + event.dy, 0, display.height);
-            handle.style.left = `${point.x}px`;
-            handle.style.top = `${point.y}px`;
-            redraw();
-          },
-        },
-      });
-      this.interactions.push(interaction);
-    });
-    redraw();
-  }
-
-  private normalizedPoints(value: unknown, fallback: Point[]): Point[] {
-    if (!Array.isArray(value) || value.length !== 4) return fallback;
-    return value.map((item, index) => {
-      const defaultPoint = fallback[index] ?? { x: 0, y: 0 };
-      if (Array.isArray(item) && item.length >= 2) {
-        return {
-          x: finiteNumber(item[0], defaultPoint.x),
-          y: finiteNumber(item[1], defaultPoint.y),
-        };
-      }
-      if (isObject(item)) {
-        return {
-          x: finiteNumber(item.x, defaultPoint.x),
-          y: finiteNumber(item.y, defaultPoint.y),
-        };
-      }
-      return defaultPoint;
-    });
-  }
-
   private async saveActiveStage(): Promise<void> {
     const context = this.activeContext();
     if (!context || !this.activePageId || !this.editable) return;
-    const trigger = this.stageTrigger(this.activePageId, this.activeStage);
-    const url = trigger?.dataset.stageUrl;
+    const url = this.url("stageUrlTemplate", this.activePageId, this.activeStage);
     if (!url) return;
+    this.saving = true;
     this.saveButton.disabled = true;
     this.setMessage("Saving revision and queueing a preview…", "info");
     try {
@@ -1438,27 +1766,36 @@ class WorkspaceController {
       if (!response.ok) throw new Error(await response.text());
       const payload = (await response.json()) as { stage: StageState };
       this.mergeStage(payload.stage);
+      const done = payload.stage.status === "success";
       this.setMessage(
-        payload.stage.status === "success"
-          ? "Saved. Result preview is ready."
-          : "Saved. The worker is generating the new preview.",
+        done && payload.stage.stage === "deskew"
+          ? `Saved. ${deskewResultText(payload.stage.parameters)}`
+          : done && payload.stage.stage === "dewarping"
+            ? `Saved. ${describeDewarp(payload.stage.parameters)}`
+          : done && payload.stage.stage === "select_content"
+            ? `Saved. ${describeContent(payload.stage.parameters, this.contentBox(), this.contentDpi())}`
+            : done
+            ? "Saved. Result preview is ready."
+            : "Saved. The worker is generating the new preview.",
         "success",
       );
     } catch (error) {
       this.setMessage(error instanceof Error ? error.message : "Stage update failed.", "error");
     } finally {
+      this.saving = false;
       this.saveButton.disabled = !this.editable;
+      if (!this.saveQueued) this.syncDeskewControls();
     }
   }
 
   private async applyBatch(): Promise<void> {
     if (!this.editable) return;
-    const batchUrl = this.root.querySelector<HTMLElement>(
-      `[data-batch-url][data-stage="${this.activeStage}"]`,
-    )?.dataset.batchUrl;
+    const batchUrl = this.url("batchUrlTemplate", "", this.activeStage);
     if (!batchUrl) return;
-    const selected = [...this.selectedPages];
-    if (this.batchScope.value === "selected" && selected.length === 0) {
+    const scope = (this.batchScope.value || "selected") as ApplyScope;
+    const order = this.strip?.displayOrder() ?? this.naturalOrder;
+    const pageIds = applyScopePages(scope, order, this.activePageId, this.selectedPages);
+    if (pageIds !== null && pageIds.length === 0) {
       this.setMessage("Select at least one page before applying a batch.", "error");
       return;
     }
@@ -1468,7 +1805,7 @@ class WorkspaceController {
       parameters: this.draft,
       preserve_exceptions: this.preserveExceptions.checked,
     };
-    if (this.batchScope.value === "selected") body.page_ids = selected;
+    if (pageIds !== null) body.page_ids = pageIds;
     try {
       const response = await fetch(batchUrl, {
         method: "POST",
@@ -1517,28 +1854,245 @@ class WorkspaceController {
   }
 
   private updateStageDom(state: StageState): void {
-    const row = this.root.querySelector<HTMLElement>(
-      `[data-stage-row][data-page-id="${state.scan_page_id}"][data-stage="${state.stage}"]`,
+    const page = this.pages.get(state.scan_page_id);
+    if (page && this.strip) this.strip.update(this.stripItem(page));
+  }
+
+  // --- page strip ------------------------------------------------------------------
+
+  private stripItem(page: WorkspacePage): StripItem {
+    const source = stripSourceStage(page, this.activeStage);
+    const versionId = page.active_version?.id;
+    let thumbnailUrl = "";
+    if (source) {
+      const template = this.url("stageThumbnailTemplate", page.id, source.stage);
+      if (template) thumbnailUrl = `${template}?v=${artifactToken(source)}`;
+    } else if (versionId && page.work_image_token) {
+      const template = this.url("pageThumbnailTemplate", page.id);
+      if (template) thumbnailUrl = `${template}?v=${page.work_image_token}`;
+    } else {
+      // Working image still being generated: the full page thumbnail renders the scan.
+      thumbnailUrl = page.thumbnail ?? "";
+    }
+    const side = page.side && page.side !== "single" ? ` ${page.side}` : "";
+    const printed = page.recognized_page_number ? `p. ${page.recognized_page_number}` : "";
+    const size = stageSize(page, this.activeStage);
+    return {
+      id: page.id,
+      label: `${page.logical_sequence_number}${side}`,
+      caption: page.active_version?.original_filename || printed,
+      thumbnailUrl,
+      width: size.width,
+      height: size.height,
+      stages: STAGE_ORDER.map((name) => {
+        const state = stageFor(page, name);
+        return {
+          stage: name,
+          label: STAGE_LABELS[name],
+          status: state?.status ?? "unknown",
+          manual: state?.manual ?? false,
+          last_error: state?.last_error ?? "",
+          invalidated_reason: state?.invalidated_reason ?? "",
+        };
+      }),
+    };
+  }
+
+  private refreshStrip(): void {
+    if (!this.strip) return;
+    const items = this.naturalOrder
+      .map((id) => this.pages.get(id))
+      .filter((page): page is WorkspacePage => page !== undefined)
+      .map((page) => this.stripItem(page));
+    const mode = (this.sortSelect?.value ?? "natural") as SortMode;
+    this.strip.setItems(items, sortItems(items, mode));
+  }
+
+  private bindStrip(): void {
+    this.sortSelect?.addEventListener("change", () => {
+      this.refreshStrip();
+      this.strip?.setActive(this.activePageId, new Set(this.selectedPages), true);
+    });
+    this.refreshStrip();
+    document.addEventListener("keydown", (event) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, select, textarea, [contenteditable='true']")) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      const steps: Record<string, number> = {
+        ArrowDown: 1,
+        PageDown: 1,
+        w: 1,
+        W: 1,
+        ArrowUp: -1,
+        PageUp: -1,
+        q: -1,
+        Q: -1,
+        Home: -Infinity,
+        End: Infinity,
+      };
+      const step = steps[event.key];
+      if (step === undefined || !this.strip) return;
+      const order = this.strip.displayOrder();
+      const next = Number.isFinite(step)
+        ? neighbour(order, this.activePageId, step)
+        : step < 0
+          ? (order[0] ?? null)
+          : (order[order.length - 1] ?? null);
+      if (!next) return;
+      event.preventDefault();
+      this.selectedPages.clear();
+      this.activate(next, this.activeStage);
+    });
+  }
+
+  private clickPage(pageId: string, modifiers: { ctrl: boolean; shift: boolean }): void {
+    const order = this.strip?.displayOrder() ?? this.naturalOrder;
+    const next = applyClick(
+      { selected: this.selectedPages, anchor: this.selectionAnchor ?? this.activePageId },
+      order,
+      pageId,
+      modifiers,
     );
-    if (!row) return;
-    const status = row.querySelector<HTMLElement>("[data-stage-status]");
-    if (status) {
-      status.textContent = stageStatusLabel(state);
-      status.className = `status status-${state.status}`;
-      status.title =
-        state.status === "invalidated" ? (state.invalidated_reason ?? "") : "";
+    this.selectedPages.clear();
+    for (const id of next.selected) this.selectedPages.add(id);
+    this.selectionAnchor = next.anchor;
+    if (pageId !== this.activePageId) this.activate(pageId, this.activeStage);
+    else this.strip?.setActive(pageId, new Set(this.selectedPages), false);
+    this.updateSelectionCount();
+  }
+
+  // --- canvas: pan and zoom ----------------------------------------------------------
+
+  private bindCanvas(): void {
+    const viewport = this.viewport;
+    if (!viewport) return;
+    this.image.draggable = false;
+    viewport.addEventListener(
+      "wheel",
+      (event) => {
+        if (event.ctrlKey) {
+          // Upstream deskew: Ctrl+wheel rotates, Ctrl+Shift+wheel rotates finely.
+          if (this.deskewEditing()) {
+            event.preventDefault();
+            const angle = wheelAngle(this.deskewAngle(), event);
+            if (angle !== null) {
+              this.deskewOverlay?.flashGrid();
+              this.setDeskewAngle(angle, true);
+            }
+          }
+          return;
+        }
+        event.preventDefault();
+        const bounds = viewport.getBoundingClientRect();
+        this.view = zoomAt(this.view, wheelFactor(event.deltaY, event.deltaMode), {
+          x: event.clientX - bounds.left,
+          y: event.clientY - bounds.top,
+        });
+        this.applyView();
+      },
+      { passive: false },
+    );
+    let drag: { id: number; x: number; y: number } | null = null;
+    viewport.addEventListener("pointerdown", (event) => {
+      const target = event.target as HTMLElement | null;
+      // Handles and boxes own their pointer events; only the background pans.
+      if (
+        event.button !== 0 ||
+        target?.closest("[data-geometry-layer] > *, [data-captures-pointer]")
+      )
+        return;
+      drag = { id: event.pointerId, x: event.clientX, y: event.clientY };
+      viewport.setPointerCapture(event.pointerId);
+      viewport.classList.add("panning");
+    });
+    viewport.addEventListener("pointermove", (event) => {
+      if (!drag || drag.id !== event.pointerId) return;
+      this.view = panBy(this.view, event.clientX - drag.x, event.clientY - drag.y);
+      drag = { id: event.pointerId, x: event.clientX, y: event.clientY };
+      this.applyView(false);
+    });
+    const end = (event: PointerEvent): void => {
+      if (!drag || drag.id !== event.pointerId) return;
+      drag = null;
+      viewport.classList.remove("panning");
+    };
+    viewport.addEventListener("pointerup", end);
+    viewport.addEventListener("pointercancel", end);
+    const zoomButton = (selector: string, action: () => void): void => {
+      this.root.querySelector<HTMLButtonElement>(selector)?.addEventListener("click", action);
+    };
+    const centre = (): { x: number; y: number } => ({
+      x: viewport.clientWidth / 2,
+      y: viewport.clientHeight / 2,
+    });
+    zoomButton("[data-zoom-in]", () => {
+      this.view = zoomAt(this.view, 1.25, centre());
+      this.applyView();
+    });
+    zoomButton("[data-zoom-out]", () => {
+      this.view = zoomAt(this.view, 0.8, centre());
+      this.applyView();
+    });
+    zoomButton("[data-zoom-fit]", () => this.fitToPane());
+    zoomButton("[data-zoom-actual]", () => {
+      this.view = zoomAt(this.view, 1 / this.view.zoom, centre());
+      this.applyView();
+    });
+  }
+
+  private fitToPane(): void {
+    if (!this.viewport || !this.image.naturalWidth) {
+      this.renderGeometry();
+      return;
     }
-    const error = row.querySelector<HTMLElement>("[data-stage-error]");
-    if (error) {
-      const errorText = stageErrorText(state);
-      error.textContent = errorText;
-      error.hidden = !errorText;
+    this.view = fitView(
+      { width: this.viewport.clientWidth, height: this.viewport.clientHeight },
+      { width: this.image.naturalWidth, height: this.image.naturalHeight },
+    );
+    this.applyView();
+  }
+
+  /** Lay the image out at ``natural * zoom`` and translate it; redraw overlays if resized. */
+  private applyView(resized = true): void {
+    if (!this.surface || !this.image.naturalWidth) {
+      if (resized) this.renderGeometry();
+      return;
     }
-    const revision = row.querySelector<HTMLInputElement>("input[name='expected_revision']");
-    if (revision) revision.value = String(state.revision);
-    const preview = row.querySelector<HTMLElement>("[data-stage-preview-link]");
-    if (preview && (state.preview_storage_identifier || state.output_storage_identifier)) {
-      preview.hidden = false;
+    this.image.style.width = `${Math.round(this.image.naturalWidth * this.view.zoom)}px`;
+    this.image.style.height = `${Math.round(this.image.naturalHeight * this.view.zoom)}px`;
+    this.surface.style.transform = `translate(${Math.round(this.view.x)}px, ${Math.round(this.view.y)}px)`;
+    if (this.zoomLevel) this.zoomLevel.textContent = `${Math.round(this.view.zoom * 100)} %`;
+    this.applyDeskewPreview();
+    if (resized) this.renderGeometry();
+  }
+
+  // --- batch: "▶" runs a stage for every page with its own settings ---------------
+
+  private async runStageForAllPages(stage: StageName, button: HTMLButtonElement): Promise<void> {
+    if (!this.editable) return;
+    const batchUrl = this.url("batchUrlTemplate", "", stage);
+    if (!batchUrl) return;
+    button.disabled = true;
+    this.setMessage(`Running ${STAGE_LABELS[stage]} for all pages…`, "info");
+    try {
+      // No parameters: every page keeps its own settings (upstream batch processing).
+      const response = await fetch(batchUrl, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-CSRFToken": csrfToken() },
+        body: JSON.stringify({ preserve_exceptions: false }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = (await response.json()) as {
+        applied: { page_id: string; stage: StageState }[];
+        applied_count: number;
+      };
+      for (const item of payload.applied) this.mergeStage(item.stage);
+      this.setMessage(`Queued ${STAGE_LABELS[stage]} for ${payload.applied_count} page(s).`, "success");
+    } catch (error) {
+      this.setMessage(error instanceof Error ? error.message : "Batch run failed.", "error");
+    } finally {
+      button.disabled = !this.editable;
     }
   }
 
@@ -1614,5 +2168,5 @@ export function initializeScanTailorWorkspace(root: HTMLElement): void {
   new WorkspaceController(root, parseWorkspacePages()).start();
 }
 
-const workspace = document.querySelector<HTMLElement>("[data-scantailor-workspace]");
+const workspace = document.querySelector<HTMLElement>("[data-scantailor-editor]");
 if (workspace) initializeScanTailorWorkspace(workspace);

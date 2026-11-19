@@ -30,10 +30,13 @@ const SCANTAILOR_STAGES = [
   "output",
 ] as const;
 
+/** Run every stage of the job's first page in the editor, then return to the overview. */
 async function runAllScanTailorStages(page: Page): Promise<void> {
+  const overviewUrl = page.url();
+  await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
+  await expect(page).toHaveURL(/\/editor\/$/);
   for (const stage of SCANTAILOR_STAGES) {
     await page.locator(`[data-stage-select="${stage}"]`).click();
-    const stageRow = page.locator(`[data-stage-row][data-stage="${stage}"]`);
     const queued = page.waitForResponse(
       (response) =>
         response.request().method() === "POST" &&
@@ -41,10 +44,12 @@ async function runAllScanTailorStages(page: Page): Promise<void> {
     );
     await page.getByRole("button", { name: "Save and run" }).click();
     await expect((await queued).status()).toBe(202);
-    await expect(stageRow.locator("[data-stage-status]")).toHaveText("success", {
-      timeout: 30_000,
-    });
+    // The page strip's status icon for this stage (#195 step 3).
+    await expect(
+      page.locator(`[data-strip-page] .st-status-icon[data-stage="${stage}"]`).first(),
+    ).toHaveAttribute("data-status", "success", { timeout: 30_000 });
   }
+  await page.goto(overviewUrl);
 }
 
 async function waitForTextAcrossReloads(
@@ -83,6 +88,8 @@ test("two LDAP members receive a visible conflict instead of overwriting a stage
     await firstEditor.getByRole("button", { name: "Upload page" }).click();
     await expect(firstEditor.locator(".scan-page-card")).toHaveCount(1);
 
+    await firstEditor.getByRole("link", { name: "Open ScanTailor editor" }).click();
+    await expect(firstEditor).toHaveURL(/\/editor\/$/);
     const workspaceUrl = firstEditor.url();
     const secondEditor = await signIn(secondContext, "leela");
     await secondEditor.route("**/workspace/events/", (route) => route.abort());
@@ -95,14 +102,14 @@ test("two LDAP members receive a visible conflict instead of overwriting a stage
     const firstControls = firstEditor.locator("[data-stage-controls]");
     const secondControls = secondEditor.locator("[data-stage-controls]");
     // Deskew is the first stage (#195) and starts in auto mode for both editors.
-    await expect(firstControls.getByLabel("Mode")).toHaveValue("auto");
-    await expect(secondControls.getByLabel("Mode")).toHaveValue("auto");
+    await expect(firstControls.getByRole("radio", { name: "Auto" })).toBeChecked();
+    await expect(secondControls.getByRole("radio", { name: "Auto" })).toBeChecked();
 
-    await firstControls.getByLabel("Mode").selectOption("manual");
+    // Switching to manual commits at once, as upstream does (#195 step 4).
     const saved = firstEditor.waitForResponse(
       (response) => response.request().method() === "POST" && /\/stages\/deskew\/$/.test(response.url()),
     );
-    await firstEditor.getByRole("button", { name: "Save and run" }).click();
+    await firstControls.getByRole("radio", { name: "Manual" }).check();
     await expect((await saved).status()).toBe(202);
     await expect(firstEditor.locator("[data-editor-message]")).toContainText("Saved.");
 
@@ -115,7 +122,7 @@ test("two LDAP members receive a visible conflict instead of overwriting a stage
     await expect(secondEditor.locator("[data-editor-message]")).toContainText(
       "Conflict detected: another editor changed this stage",
     );
-    await expect(secondControls.getByLabel("Mode")).toHaveValue("manual");
+    await expect(secondControls.getByRole("radio", { name: "Manual" })).toBeChecked();
   } finally {
     await firstContext.close();
     await secondContext.close();

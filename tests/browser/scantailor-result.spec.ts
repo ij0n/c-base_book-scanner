@@ -27,6 +27,8 @@ for (const transport of ["events", "polling"] as const) {
     await page.getByLabel("Sequence").fill("1");
     await page.getByRole("button", { name: "Upload page" }).click();
     await expect(page.locator(".scan-page-card")).toHaveCount(1);
+    await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
+    await expect(page.locator("[data-scantailor-editor]")).toBeVisible();
 
     const input = page.getByRole("button", { name: "Input", exact: true });
     const result = page.getByRole("button", { name: "Result", exact: true });
@@ -36,17 +38,31 @@ for (const transport of ["events", "polling"] as const) {
       await expect(result).toHaveAttribute("aria-pressed", "true", { timeout: 30_000 });
       await expect(image).toHaveAttribute("alt", "Processing-stage result preview");
     };
-    for (const stage of ["deskew", "select_content"]) {
-      await page.locator(`[data-stage-select="${stage}"]`).click();
-      await save();
-    }
+    // Deskew keeps the live input view and says when it leaves a page unchanged.
+    await page.locator('[data-stage-select="deskew"]').click();
+    await page.getByRole("button", { name: "Save and run" }).click();
+    await expect(page.locator("[data-editor-message]")).toContainText("Angle 0.00°, no change", {
+      timeout: 30_000,
+    });
+    await expect(input).toHaveAttribute("aria-pressed", "true");
 
-    // Dewarping runs before Margins (#195); on a blank page it explains its fallback.
+    // Select Content also keeps the input view, with its box; this blank page has none.
+    await page.locator('[data-stage-select="select_content"]').click();
+    await page.getByRole("button", { name: "Save and run" }).click();
+    await expect(page.locator("[data-editor-message]")).toContainText("No content found", {
+      timeout: 30_000,
+    });
+    await expect(input).toHaveAttribute("aria-pressed", "true");
+
+    // Dewarping runs before Margins (#195); on a blank page it explains its fallback
+    // and stays on the input view with the model grid.
     await page.locator('[data-stage-select="dewarping"]').click();
-    await save();
-    await expect(page.locator("[data-stage-warnings]")).toContainText(
-      "the input was kept unchanged",
-    );
+    await page.getByRole("button", { name: "Save and run" }).click();
+    await expect(page.locator("[data-editor-message]")).toContainText("No text lines", {
+      timeout: 30_000,
+    });
+    await expect(page.locator("[data-stage-warnings]")).toContainText("the page is unchanged");
+    await expect(input).toHaveAttribute("aria-pressed", "true");
 
     await page.locator('[data-stage-select="margins"]').click();
     await page.getByLabel("All margins (pixels)").fill("20");
@@ -69,9 +85,7 @@ for (const transport of ["events", "polling"] as const) {
       .toBe(100);
 
     await page.locator('[data-stage-select="dewarping"]').click();
-    await expect(page.locator("[data-stage-warnings]")).toContainText(
-      "the input was kept unchanged",
-    );
+    await expect(page.locator("[data-stage-warnings]")).toContainText("the page is unchanged");
     await page.locator('[data-stage-select="margins"]').click();
     await expect(page.locator("[data-stage-warnings]")).toBeHidden();
   });

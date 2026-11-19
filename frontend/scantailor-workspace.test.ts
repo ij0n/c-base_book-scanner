@@ -4,7 +4,6 @@ import {
   artifactToken,
   displayBoxToSource,
   editableParameters,
-  curvatureCurvesForEditing,
   INITIAL_PREVIEW_RETRY,
   initializeScanTailorWorkspace,
   nextPreviewRetry,
@@ -54,89 +53,6 @@ describe("ScanTailor geometry coordinates", () => {
 });
 
 describe("editable stage parameters", () => {
-  it("copies curvature geometry only after explicit manual editing", () => {
-    const curves = [
-      [
-        [0, 20],
-        [50, 25],
-        [99, 20],
-      ],
-      [
-        [0, 80],
-        [50, 85],
-        [99, 80],
-      ],
-    ];
-    const parameters = {
-      dewarp_model: "curvature",
-      dewarp_mode: "auto",
-      curvature_curves: curves,
-      curvature_model_version: "derived",
-    };
-    const authored = curvatureCurvesForEditing(parameters);
-    authored[0]![1]![1] = 30;
-    expect(curves[0]![1]![1]).toBe(25);
-    expect(editableParameters("dewarping", parameters)).toEqual({
-      dewarp_model: "curvature",
-      dewarp_mode: "auto",
-    });
-    expect(
-      editableParameters("dewarping", { dewarp_mode: "manual", dewarp_curves: authored }),
-    ).toEqual({ dewarp_mode: "manual", dewarp_curves: authored });
-  });
-
-  it("edits and saves replayable baseline controls without sending detected provenance", async () => {
-    const state = {
-      id: 1,
-      stage: "dewarping",
-      stage_label: "Dewarping",
-      revision: 1,
-      status: "success",
-      algorithm: "baseline_curvature",
-      parameters: {
-        dewarp_model: "curvature",
-        dewarp_mode: "auto",
-        input_width: 100,
-        input_height: 200,
-        curvature_curves: [
-          [
-            [0, 40],
-            [50, 50],
-            [99, 40],
-          ],
-          [
-            [0, 140],
-            [50, 150],
-            [99, 140],
-          ],
-        ],
-      },
-    };
-    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script><div id="curvature-host" data-editable="true"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><button data-stage-select="dewarping">Dewarping</button><button data-stage-open data-page-id="page" data-stage="dewarping" data-stage-url="/dewarp"></button></div>`;
-    const fetcher = vi
-      .fn()
-      .mockResolvedValue({ ok: true, status: 202, json: async () => ({ stage: state }) });
-    vi.stubGlobal("fetch", fetcher);
-    const host = document.querySelector<HTMLElement>("#curvature-host")!;
-    initializeScanTailorWorkspace(host);
-    host.querySelector<HTMLButtonElement>('[data-stage-select="dewarping"]')!.click();
-    [...host.querySelectorAll("button")]
-      .find((b) => b.textContent === "Edit detected baselines")!
-      .click();
-    const input = [...host.querySelectorAll("label")]
-      .find((label) => label.textContent === "Baseline point 2 y")!
-      .querySelector("input")!;
-    input.value = "65";
-    input.dispatchEvent(new Event("change"));
-    host.querySelector<HTMLButtonElement>("[data-save-stage]")!.click();
-    await vi.waitFor(() => expect(fetcher).toHaveBeenCalled());
-    const payload = JSON.parse(fetcher.mock.calls[0]![1].body);
-    expect(payload.parameters.dewarp_curves[0][1]).toEqual([50, 65]);
-    expect(payload.parameters.dewarp_mode).toBe("manual");
-    expect(payload.parameters).not.toHaveProperty("curvature_curves");
-    vi.unstubAllGlobals();
-    document.body.replaceChildren();
-  });
   it("turns detected geometry into independent editable lists, excluding provenance", () => {
     const parameters = {
       zone_mode: "auto",
@@ -184,7 +100,7 @@ describe("editable stage parameters", () => {
       },
     };
     document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script>
-      <div id="zones-host" data-editable="true"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-stage-select="output">Output</button><button data-stage-open data-page-id="page" data-stage="output" data-stage-url="/output"></button></div>`;
+      <div id="zones-host" data-editable="true" data-stage-url-template="/pages/__PAGE__/stages/__STAGE__/"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-stage-select="output">Output</button></div>`;
     const fetcher = vi.fn().mockResolvedValue({
       ok: true,
       status: 202,
@@ -471,7 +387,7 @@ describe("editor preview recovery (#195)", () => {
       status: "unknown",
       parameters: {},
     };
-    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script><div id="retry-host" data-editable="true"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><button data-stage-select="deskew">Deskew</button><button data-stage-open data-page-id="page" data-stage="deskew" data-input-preview-url="/preview/?input=true"></button></div>`;
+    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script><div id="retry-host" data-editable="true" data-preview-url-template="/__PAGE__/preview/"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><button data-stage-select="deskew">Deskew</button></div>`;
     const host = document.querySelector<HTMLElement>("#retry-host")!;
     initializeScanTailorWorkspace(host);
     return {
@@ -490,20 +406,20 @@ describe("editor preview recovery (#195)", () => {
       .mockResolvedValue(response(200));
     vi.stubGlobal("fetch", fetcher);
     const { image, message } = mountDeskew();
-    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown");
+    expect(image.getAttribute("src")).toBe("/page/preview/?input=true&revision=1-unknown");
 
     image.dispatchEvent(new Event("error"));
     await flush();
     expect(message.textContent).toMatch(/still being prepared/);
     await vi.advanceTimersByTimeAsync(999);
-    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown");
+    expect(image.getAttribute("src")).toBe("/page/preview/?input=true&revision=1-unknown");
     await vi.advanceTimersByTimeAsync(1);
-    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown&retry=1");
+    expect(image.getAttribute("src")).toBe("/page/preview/?input=true&revision=1-unknown&retry=1");
 
     image.dispatchEvent(new Event("error"));
     await flush();
     await vi.advanceTimersByTimeAsync(2000);
-    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown&retry=2");
+    expect(image.getAttribute("src")).toBe("/page/preview/?input=true&revision=1-unknown&retry=2");
 
     // Generation finished: this load succeeds and the stage status returns.
     image.dispatchEvent(new Event("load"));
@@ -520,13 +436,13 @@ describe("editor preview recovery (#195)", () => {
     image.dispatchEvent(new Event("error"));
     await flush();
     await vi.advanceTimersByTimeAsync(0);
-    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown&retry=1");
+    expect(image.getAttribute("src")).toBe("/page/preview/?input=true&revision=1-unknown&retry=1");
 
     // A response that is fine but undecodable is not reloaded forever.
     image.dispatchEvent(new Event("error"));
     await flush();
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown&retry=1");
+    expect(image.getAttribute("src")).toBe("/page/preview/?input=true&revision=1-unknown&retry=1");
   });
 
   it("gives up after the retry budget with an explanation", async () => {
@@ -553,11 +469,10 @@ describe("editor preview recovery (#195)", () => {
     await flush();
     // Showing the result mode (no result yet) keeps the same URL; switching the
     // source clears the pending retry.
-    const trigger = host.querySelector<HTMLElement>("[data-stage-open]")!;
-    trigger.dataset.inputPreviewUrl = "/other/?input=true";
+    host.dataset.previewUrlTemplate = "/other/__PAGE__/preview/";
     host.querySelector<HTMLButtonElement>("[data-preview-input]")!.click();
-    expect(image.getAttribute("src")).toBe("/other/?input=true&revision=1-unknown");
+    expect(image.getAttribute("src")).toBe("/other/page/preview/?input=true&revision=1-unknown");
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(image.getAttribute("src")).toBe("/other/?input=true&revision=1-unknown");
+    expect(image.getAttribute("src")).toBe("/other/page/preview/?input=true&revision=1-unknown");
   });
 });

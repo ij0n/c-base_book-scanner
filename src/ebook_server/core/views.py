@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import tempfile
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -36,6 +37,7 @@ from django.urls import reverse
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
+from PIL import Image, UnidentifiedImageError
 
 from ebook_server.storage import (
     LocalFilesystemStorage,
@@ -108,6 +110,7 @@ def _serialize_scan_page_version(version: ScanPageVersion | None) -> dict[str, A
         "page_number_verified": version.page_number_verified,
         "is_active": version.is_active,
         "storage_identifier": version.storage_identifier,
+        "original_filename": version.original_filename,
         "created_at": version.created_at.isoformat(),
     }
 
@@ -188,6 +191,8 @@ def _serialize_stage_state(state: ScanTailorStageState) -> dict[str, Any]:
         "output_sha256": state.output_sha256,
         "last_error": state.last_error,
         "invalidated_reason": state.invalidated_reason,
+        # Done with a manual override: a blue status icon in the page strip (#195).
+        "manual": _is_manual_stage_state(state),
         "started_at": state.started_at.isoformat() if state.started_at else None,
         "finished_at": state.finished_at.isoformat() if state.finished_at else None,
         "created_at": state.created_at.isoformat(),
@@ -1179,8 +1184,11 @@ def _contains_stage_manual_override(stage: str, parameters: dict[str, Any]) -> b
     if stage == "deskew":
         return "manual_angle" in parameters
     if stage == "select_content":
-        if str(parameters.get("content_mode", "")).strip().lower() == "manual":
-            return True
+        mode = str(parameters.get("content_mode", "")).strip().lower()
+        if mode:
+            # Auto results record the box they found; only the chosen mode counts
+            # (#195 step 5). Disabled is a deliberate per-page choice too.
+            return mode in {"manual", "disabled"}
         return "content_box" in parameters
     if stage == "margins":
         if str(parameters.get("margins_mode", "")).strip().lower() == "manual":
@@ -1190,9 +1198,11 @@ def _contains_stage_manual_override(stage: str, parameters: dict[str, Any]) -> b
             for key in {"top", "right", "bottom", "left", "margin", "canvas_width", "canvas_height"}
         )
     if stage == "dewarping":
-        if str(parameters.get("dewarp_mode", "")).strip().lower() == "manual":
-            return True
-        return "dewarp_points" in parameters or "dewarp_curves" in parameters
+        mode = str(parameters.get("dewarp_mode", "")).strip().lower()
+        if mode:
+            # Auto results record the curves they found; only the chosen mode counts.
+            return mode in {"manual", "off", "bypass"}
+        return "top_curve" in parameters or "dewarp_curves" in parameters
     if stage == "output":
         if str(parameters.get("zone_mode", "")).strip().lower() == "manual":
             return True
@@ -1254,12 +1264,6 @@ def _apply_stage_payload_to_state(
         elif stage == "margins":
             if _contains_stage_manual_override(stage, merged):
                 merged.setdefault("margins_mode", "manual")
-        elif stage == "dewarping":
-            model = merged.get("dewarp_model")
-            if isinstance(model, str) and model in {"perspective", "curvature"}:
-                state.algorithm = (
-                    "baseline_curvature" if model == "curvature" else "projective_dewarp"
-                )
         elif stage == "output":
             output_mode = str(merged.get("output_mode", "")).strip().lower()
             if output_mode in {"otsu", "sauvola", "wolf", "fox", "window", "grad", "copy"}:
@@ -1384,6 +1388,53 @@ def scan_job_workspace_state(request: HttpRequest, job_id: str) -> HttpResponseB
             "stages": [_serialize_stage_state(state) for state in states.order_by("pk")],
         }
     )
+
+
+@require_GET
+@login_required
+def scan_job_editor(request: HttpRequest, job_id: str) -> HttpResponseBase:
+    """The ScanTailor editor: stage list, preview canvas and page strip (#195 step 3).
+
+    Upstream Scan Tailor's main window: the whole viewport, three columns. The job
+    overview (``workspace/``) keeps uploads, identification, finishing and the
+    no-JavaScript Run forms.
+    """
+    if normalize_scan_job_id(job_id) is None:
+        return HttpResponseBadRequest("invalid job id")
+    job = ScanJob.objects.filter(pk=job_id).first()
+    if job is None:
+        return HttpResponseNotFound()
+    return render(
+        request,
+        "core/scan_editor.html",
+        {
+            "job": job,
+            "pages": _serialize_workspace_pages(job),
+            "editable": job.state in scan_lifecycle.PROCESSING_STATES,
+            "stage_navigation": [
+                {
+                    "name": stage,
+                    "label": ScanTailorStageState.Stage(stage).label,
+                    "hint": EDITOR_STAGE_HINTS.get(stage, ""),
+                }
+                for stage in scantailor.stage_order()
+            ],
+        },
+    )
+
+
+# Status-bar hints; Deskew, Select Content and Margins are upstream Scan Tailor's
+# ImageView strings (filters/*/ImageView.cpp).
+EDITOR_STAGE_HINTS: Final[dict[str, str]] = {
+    "deskew": "Use Ctrl+Wheel to rotate or Ctrl+Shift+Wheel for finer rotation.",
+    "select_content": "Drag lines or corners to resize the content box.",
+    "dewarping": (
+        "Drag the red points to bend the grid; click the top or bottom curve to add a "
+        "point, press Del or D to remove one."
+    ),
+    "margins": "Resize margins by dragging any of the solid lines.",
+    "output": "Draw text and picture zones; choose how each kind is binarised.",
+}
 
 
 @require_GET
@@ -2310,6 +2361,79 @@ def scan_todo_cancel(
         return JsonResponse({"todo_id": todo.id, "state": todo.state})
     todo.cancel()
     return JsonResponse({"todo_id": todo.id, "state": todo.state})
+
+
+@require_GET
+@scan_api_login_required
+def scan_page_stage_thumbnail(
+    request: HttpRequest, job_id: str, page_id: str, stage: str
+) -> HttpResponseBase:
+    """Strip thumbnail of a completed stage (#195 step 3), cacheable with ``?v=``.
+
+    Stages published before thumbnails existed get theirs made from the preview on
+    first request (small: the preview is working-resolution).
+    """
+    if normalize_scan_job_id(job_id) is None or _coerce_uuid(page_id) is None:
+        return HttpResponseBadRequest("invalid uuid")
+    normalized_stage = _normalize_stage(stage)
+    if normalized_stage is None:
+        return HttpResponseBadRequest("invalid stage")
+    state = ScanTailorStageState.objects.filter(
+        scan_job_id=job_id, scan_page_id=page_id, stage=normalized_stage
+    ).first()
+    if state is None:
+        return HttpResponseNotFound()
+    token = _stage_artifact_token(state)
+    identifier = scantailor.stage_thumbnail_identifier(state)
+    if not token or not identifier:
+        return HttpResponseNotFound("thumbnail not ready")
+    storage = _default_scan_storage()
+    if not storage.exists(identifier):
+        source = state.preview_storage_identifier or state.output_storage_identifier
+        try:
+            with Image.open(storage.resolve_location(source)) as preview:
+                preview.load()
+                small = scantailor._thumbnail(
+                    scan_images.ensure_rgb_or_l(preview), scan_images.THUMBNAIL_EDGE
+                )
+            with tempfile.TemporaryDirectory(prefix="stage-thumb-") as tempdir:
+                staged = Path(tempdir) / "thumbnail.jpg"
+                scan_images.save_preview_jpeg(small, staged)
+                storage.store_atomic(str(staged), identifier)
+        except FileNotFoundError:
+            return HttpResponseNotFound("preview artifact missing")
+        except (OSError, UnidentifiedImageError):
+            return HttpResponse("storage unavailable", status=503)
+    return _serve_scan_artifact(
+        request, storage=storage, identifier=identifier, token=token, content_type="image/jpeg"
+    )
+
+
+@require_GET
+@scan_api_login_required
+def scan_page_small_thumbnail(request: HttpRequest, page_id: str) -> HttpResponseBase:
+    """The 400 px thumbnail of the page's active version (#195), for the page strip."""
+    if _coerce_uuid(page_id) is None:
+        return HttpResponseBadRequest("invalid page id")
+    page = ScanPage.objects.filter(pk=page_id).first()
+    if page is None:
+        return HttpResponseNotFound()
+    version = page.active_version()
+    if version is None:
+        return HttpResponseNotFound("no page version")
+    page_image = (
+        ScanPageImage.objects.select_related("storage_location").filter(version=version).first()
+    )
+    if page_image is None:
+        scan_images.request_page_image(version.pk)  # deduplicated (#197)
+        return HttpResponseNotFound("thumbnail not ready")
+    return _serve_scan_artifact(
+        request,
+        storage=backend_for_location(page_image.storage_location),
+        identifier=page_image.thumbnail_storage_identifier,
+        token=_work_image_token(version, page_image),
+        content_type="image/jpeg",
+    )
 
 
 @require_GET
